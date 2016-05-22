@@ -240,17 +240,20 @@ int convolve2D(int* in, int* out, int dataSizeX, int dataSizeY,
     kCenterX = (int)kernelSizeX / 2;
     kCenterY = (int)kernelSizeY / 2;
 
+    //For the MPI implementation we have done the same data decomposition than in OMP.
+    //The first process (ID = 0) have the job to do its calculation work but also it's the one that receives and join 
+    //all the data from the others
     int idThread;
-    MPI_Comm_rank(MPI_COMM_WORLD,&idThread);
+    MPI_Comm_rank(MPI_COMM_WORLD,&idThread); //To get the current thread number
     int numThreads;
-    MPI_Comm_size(MPI_COMM_WORLD,&numThreads);
+    MPI_Comm_size(MPI_COMM_WORLD,&numThreads); //To get the number of threads
 
     
     // start convolution
-    int myStart = (dataSizeY/numThreads)*(idThread);
-    int workSize = (dataSizeY/numThreads)*dataSizeX;
+    int myStart = (dataSizeY/numThreads)*(idThread);		//Calculation of the start for each thread
+    int workSize = (dataSizeY/numThreads)*dataSizeX;		//WorkSize for each thread
     int myEnd = 0;
-    if(idThread == numThreads-1){
+    if(idThread == numThreads-1){	//If we are the last thread we have to do a different partition of the data.
         myEnd = dataSizeY;
         workSize = dataSizeX*dataSizeY - (workSize*(numThreads-1));
     }else{
@@ -261,8 +264,8 @@ int convolve2D(int* in, int* out, int dataSizeX, int dataSizeY,
     inPtr = inPtr2 = &in[dataSizeX * kCenterY + kCenterX];  // note that  it is shifted (kCenterX, kCenterY),
     outPtr = out;
     
-    int *auxOptr = outPtr+ (myStart*dataSizeX);
-    int *pointerToStart = auxOptr;
+    int *auxOptr = outPtr+ (myStart*dataSizeX);		
+    int *pointerToStart = auxOptr;			
     int *auxInptr = inPtr + (myStart*dataSizeX);
     int *auxInptr2 = auxInptr;
     
@@ -317,14 +320,14 @@ int convolve2D(int* in, int* out, int dataSizeX, int dataSizeY,
         for(iLoop = 1; iLoop < numThreads; iLoop++)
         {
             if(iLoop == numThreads-1){
-                workSize = dataSizeX*dataSizeY - (workSize*(numThreads-1)); // TODO -> Change to correct value
+                workSize = dataSizeX*dataSizeY - (workSize*(numThreads-1)); 
             }else{
                 workSize = (dataSizeY/numThreads)*dataSizeX;
             }
             int *resultOut;
             resultOut = (int*)malloc(sizeof(int)*workSize);
-            MPI_Recv(resultOut, workSize, MPI_INT, iLoop, 0, MPI_COMM_WORLD, &status);
-            for(z = 0; z <workSize; z++){                
+            MPI_Recv(resultOut, workSize, MPI_INT, iLoop, 0, MPI_COMM_WORLD, &status); //We are the thread 0 so we have to receive all the results
+            for(z = 0; z <workSize; z++){                			       //from other threads and join them
                *auxOptr = *resultOut;
                ++auxOptr;
                ++resultOut;
@@ -334,8 +337,8 @@ int convolve2D(int* in, int* out, int dataSizeX, int dataSizeY,
     }
     else
     {      
-        MPI_Send(pointerToStart, workSize, MPI_INT, 0, 0, MPI_COMM_WORLD);
-    }
+        MPI_Send(pointerToStart, workSize, MPI_INT, 0, 0, MPI_COMM_WORLD);	//We've calculated the out and now we send the result to
+    }										//process 0
 
     return 0;
 }
