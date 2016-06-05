@@ -1,5 +1,5 @@
 //
-//
+//  convolution.c
 //
 //
 //  Created by Josep Lluis Lerida on 11/03/15.
@@ -16,8 +16,8 @@
 #include <stdlib.h>
 #include <sys/time.h>
 #include <time.h>
+#include <mpi.h>
 #include <omp.h>
-
 // Estructura per emmagatzemar el contingut d'una imatge.
 struct imagenppm{
     int altura;
@@ -224,15 +224,15 @@ void freeImagestructure(ImagenData *src){
 int convolve2D(int* in, int* out, int dataSizeX, int dataSizeY,
                float* kernel, int kernelSizeX, int kernelSizeY)
 {
-    int i, j, m, n;
+    int i, j, m, n, iLoop;
     int *inPtr, *inPtr2, *outPtr;
     float *kPtr;
     int kCenterX, kCenterY;
-    int rowMin, rowMax;                             // to check boundary of input array
-    int colMin, colMax;
+    int rowMin= 0, rowMax= 0;                             // to check boundary of input array
+    int colMin, colMax;                             //
     float sum;                                      // temp accumulation buffer
 
-    // check validity of params
+    
     if(!in || !out || !kernel) return -1;
     if(dataSizeX <= 0 || kernelSizeX <= 0) return -1;
 
@@ -240,41 +240,99 @@ int convolve2D(int* in, int* out, int dataSizeX, int dataSizeY,
     kCenterX = (int)kernelSizeX / 2;
     kCenterY = (int)kernelSizeY / 2;
 
-    // start convolution
-    #pragma omp parallel num_threads(4) private(i, j, n, m, kPtr, inPtr, outPtr, rowMin, rowMax, colMin, colMax, sum)
+    int rank;
+    MPI_Comm_rank(MPI_COMM_WORLD,&rank);
+    int nProcs ;
+    MPI_Comm_size(MPI_COMM_WORLD,&nProcs);
+    MPI_Status status;
+    
+
+    int workSize = (dataSizeY/nProcs)*dataSizeX;
+    int rowsPerThread = 0;
+    int workSizeLastThread = dataSizeX*dataSizeY - (workSize*(nProcs-1)) + (kernelSizeX* dataSizeX);
+    if(rank == nProcs-1){
+
+        workSize = workSizeLastThread;
+    }else{
+        workSize = workSize + (kernelSizeX*dataSizeX);
+    }
+    kPtr = kernel;
+   
+    
+    int *pointerToStartOut;
+    int *pointerToStartInt;
+    int threadRowStart = 0;
+    
+    // master send work to his childs. It sends the chunk of file readed. 
+    if(rank == 0)
+    {   
+        inPtr = inPtr2 = &in[dataSizeX * kCenterY + kCenterX];                  // note that  it is shifted (kCenterX, kCenterY),
+        outPtr = out;             
+     
+        for(iLoop = 1; iLoop < nProcs; iLoop++)
+        {
+            // correct pointers to sent to the childs
+            threadRowStart = (dataSizeY/nProcs)*(iLoop); 
+            int threadRowStartLessKernel= (threadRowStart - kernelSizeX);
+            pointerToStartInt = inPtr + (threadRowStartLessKernel *dataSizeX);
+            
+            if(iLoop == nProcs-1){
+               workSize = workSizeLastThread;              
+            }else{
+                int inPtrRows = (dataSizeY/nProcs)*dataSizeX ;
+                int kernelRows = (kernelSizeX*dataSizeX);
+                workSize =  inPtrRows + kernelRows; // 1 row is X colums.
+                
+            }     
+            MPI_Send(pointerToStartInt, workSize, MPI_INT, iLoop, 0, MPI_COMM_WORLD); // tag 0 is out file        
+        }        
+        workSize = (dataSizeY/nProcs)*dataSizeX + (kernelSizeX*dataSizeX);       
+    }
+    else
+    {      
+      
+        inPtr = inPtr2 = (int*)malloc(sizeof(int)*workSize);
+        outPtr = (int*)malloc(sizeof(int)*workSize);
+        MPI_Recv(inPtr, workSize, MPI_INT, 0, 0, MPI_COMM_WORLD, &status);    
+    }
+
+    pointerToStartOut = outPtr;
+    rowsPerThread = workSize/dataSizeX;
+    int *auxOutPtr ;
+    
+    #pragma omp parallel num_threads(4) firstprivate(i, j, n, m, kPtr, outPtr, auxOutPtr,rowMin, rowMax, colMin, colMax, sum)
     {
 
         int idThread = omp_get_thread_num();
-        int myStart = (dataSizeY/omp_get_num_threads())*(idThread);
+        int myStart = (rowsPerThread/omp_get_num_threads())*(idThread);
         int myEnd = 0;
+        
         if(idThread == omp_get_num_threads()-1){
-            myEnd = dataSizeY;
+            myEnd = rowsPerThread;
         }else{
-            myEnd= (dataSizeY/omp_get_num_threads())*(idThread+1);
-
+            myEnd = (rowsPerThread/omp_get_num_threads())*(idThread+1);
         }
+        
+        
         kPtr = kernel;
-        inPtr = inPtr2 = &in[dataSizeX * kCenterY + kCenterX];  // note that  it is shifted (kCenterX, kCenterY),
-        outPtr = out;
-        int *auxOptr = outPtr+ (myStart*dataSizeX);
+        auxOutPtr = outPtr+ (myStart*dataSizeX);
         int *auxInptr = inPtr + (myStart*dataSizeX);
         int *auxInptr2 = auxInptr;
 
-	    for(i= myStart; i < myEnd; ++i)                   // number of rows
-	    {
-		// compute the range of convolution, the current row of kernel should be between these
-		rowMax = i  + kCenterY;
-		rowMin = i - myEnd + kCenterY;
+        for(i= myStart; i < myEnd; ++i)                                         // number of rows
+        {
+            // compute the range of convolution, the current row of kernel should be between these
+            rowMax = i  + kCenterY;
+            rowMin = i - dataSizeY + kCenterY;
 
-
-            for(j = 0; j < dataSizeX; ++j)              // number of columns
+            for(j = 0; j < dataSizeX; ++j)                                      // number of columns
             {
                 // compute the range of convolution, the current column of kernel should be between these
                 colMax = j + kCenterX;
                 colMin = j - dataSizeX + kCenterX;
 
-                sum = 0;                                // set to 0 before accumulate
-                for(m = 0; m < kernelSizeY; ++m)        // kernel rows
+                sum = 0;                                                        // set to 0 before accumulate
+                for(m = 0; m < kernelSizeY; ++m)                                // kernel rows
                 {
 
                     if(m <= rowMax && m > rowMin)
@@ -284,27 +342,78 @@ int convolve2D(int* in, int* out, int dataSizeX, int dataSizeY,
                             if(n <= colMax && n > colMin){
 
                                sum += *(auxInptr - n) * *kPtr;
-                            }
-                            ++kPtr;                     // next kernel
+                            }   
+                            ++kPtr;                                             // next kernel
                         }
                     }
                     else
-                        kPtr += kernelSizeX;            // out of bound, move to next row of kernel
+                        kPtr += kernelSizeX;                                    // out of bound, move to next row of kernel
 
-                    auxInptr -= dataSizeX;                // move input data 1 raw up
+                    auxInptr -= dataSizeX;                                      // move input data 1 raw up
                 }
 
-                if(sum >= 0) *auxOptr= (int)(sum + 0.5f);
+                if(sum >= 0) *auxOutPtr= (int)(sum + 0.5f);
 
-                else *auxOptr = (int)(sum - 0.5f);
+                else *auxOutPtr = (int)(sum - 0.5f);
 
                 kPtr = kernel;
-                ++auxOptr;
-                auxInptr = ++auxInptr2;                        // reset kernel to (0,0)
+                ++auxOutPtr;
+                auxInptr = ++auxInptr2;                                         // reset kernel to (0,0)
 
             }
-	    }
+        }
     }
+    
+    int z, w=0;
+    
+    // MPI receive. 
+    if(rank == 0)
+    {        
+        workSize = 0;
+        
+        outPtr = out;             
+     
+        for(iLoop = 1; iLoop < nProcs; iLoop++)
+        {
+           
+            threadRowStart = (dataSizeY/nProcs)*(iLoop); 
+            int threadRowStartLessKernel= (threadRowStart - kernelSizeX);
+            pointerToStartOut = outPtr + ( (threadRowStartLessKernel +kernelSizeX) *dataSizeX);
+                      
+            
+            if(iLoop == nProcs-1){
+                workSize = workSizeLastThread;        
+            }else{
+                int inPtrRows = (dataSizeY/nProcs)*dataSizeX ;
+                int kernelRows = (kernelSizeX*dataSizeX);
+                workSize =  inPtrRows + kernelRows;
+               
+            }          
+
+
+            int *resultOut;
+            resultOut = (int*)malloc(sizeof(int)*(workSize));
+            MPI_Recv(resultOut, workSize, MPI_INT, iLoop, 0, MPI_COMM_WORLD, &status);
+            auxOutPtr = pointerToStartOut;
+            resultOut += kernelSizeX  *dataSizeX;
+             
+             for(z = 0; z <workSize - (kernelSizeX * dataSizeX); z++){  
+               *auxOutPtr = *resultOut;
+               ++auxOutPtr;
+               ++resultOut;
+               w++;
+            }
+             
+               
+                     
+        }
+    }
+    else
+    {      
+         
+        MPI_Send(pointerToStartOut, workSize , MPI_INT, 0, 0, MPI_COMM_WORLD);
+    }
+    
     return 0;
 }
 
@@ -316,10 +425,7 @@ int main(int argc, char **argv)
 {
     int i=0,j=0,k=0;
 //    int headstored=0, imagestored=0, stored;
-
-    omp_set_dynamic(0);
-    omp_set_num_threads(4);
-
+  
     if(argc != 5)
     {
         printf("Usage: %s <image-file> <kernel-file> <result-file> <partitions>\n", argv[0]);
@@ -332,6 +438,9 @@ int main(int argc, char **argv)
         printf("- partitions : Image partitions\n\n");
         return -1;
     }
+    MPI_Init(&argc, &argv);
+    int rank;
+    MPI_Comm_rank(MPI_COMM_WORLD, &rank);
 
     //////////////////////////////////////////////////////////////////////////////////////////////////
     // READING IMAGE HEADERS, KERNEL Matrix, DUPLICATE IMAGE DATA, OPEN RESULTING IMAGE FILE
@@ -357,7 +466,7 @@ int main(int argc, char **argv)
         return -1;
     }
     //The matrix kernel define the halo size to use with the image. The halo is zero when the image is not partitioned.
-    if (partitions==1) halo=0;
+    if (partitions==1) halo=0; 
     else halo = (kern->kernelY/2)*2;
     gettimeofday(&tim, NULL);
     treadk = treadk + (tim.tv_sec+(tim.tv_usec/1000000.0) - start);
@@ -366,109 +475,29 @@ int main(int argc, char **argv)
     //Reading Image Header. Image properties: Magical number, comment, size and color resolution.
     gettimeofday(&tim, NULL);
     start = tim.tv_sec+(tim.tv_usec/1000000.0);
+
     //Memory allocation based on number of partitions and halo size.
-    if ( (source = initimage(argv[1], &fpsrc, partitions, halo)) == NULL) {
-        return -1;
-    }
-    gettimeofday(&tim, NULL);
-    tread = tread + (tim.tv_sec+(tim.tv_usec/1000000.0) - start);
-
-    //Duplicate the image struct.
-    gettimeofday(&tim, NULL);
-    start = tim.tv_sec+(tim.tv_usec/1000000.0);
-    if ( (output = duplicateImageData(source, partitions, halo)) == NULL) {
-        return -1;
-    }
-    gettimeofday(&tim, NULL);
-    tcopy = tcopy + (tim.tv_sec+(tim.tv_usec/1000000.0) - start);
-
-    ////////////////////////////////////////
-    //Initialize Image Storing file. Open the file and store the image header.
-    gettimeofday(&tim, NULL);
-    start = tim.tv_sec+(tim.tv_usec/1000000.0);
-    if (initfilestore(output, &fpdst, argv[3], &position)!=0) {
-        perror("Error: ");
-        //        free(source);
-        //        free(output);
-        return -1;
-    }
-    gettimeofday(&tim, NULL);
-    tstore = tstore + (tim.tv_sec+(tim.tv_usec/1000000.0) - start);
-
-    //////////////////////////////////////////////////////////////////////////////////////////////////
-    // CHUNK READING
-    //////////////////////////////////////////////////////////////////////////////////////////////////
-    int c=0, offset=0;
-    imagesize = source->altura*source->ancho;
-    partsize  = (source->altura*source->ancho)/partitions;
-//    printf("%s ocupa %dx%d=%d pixels. Partitions=%d, halo=%d, partsize=%d pixels\n", argv[1], source->altura, source->ancho, imagesize, partitions, halo, partsize);
-    while (c < partitions) {
-        ////////////////////////////////////////////////////////////////////////////////
-        //Reading Next chunk.
-        gettimeofday(&tim, NULL);
-        start = tim.tv_sec+(tim.tv_usec/1000000.0);
-        if (c==0) {
-            halosize  = halo/2;
-            chunksize = partsize + (source->ancho*halosize);
-            offset   = 0;
-        }
-        else if(c<partitions-1) {
-            halosize  = halo;
-            chunksize = partsize + (source->ancho*halosize);
-            offset    = (source->ancho*halo/2);
-        }
-        else {
-            halosize  = halo/2;
-            chunksize = partsize + (source->ancho*halosize);
-            offset    = (source->ancho*halo/2);
-        }
-        //DEBUG
-//        printf("\nRound = %d, position = %ld, partsize= %d, chunksize=%d pixels\n", c, position, partsize, chunksize);
-
-        if (readImage(source, &fpsrc, chunksize, halo/2, &position)) {
+    if(rank == 0){
+        if ( (source = initimage(argv[1], &fpsrc, partitions, halo)) == NULL) {
             return -1;
         }
         gettimeofday(&tim, NULL);
         tread = tread + (tim.tv_sec+(tim.tv_usec/1000000.0) - start);
 
-        //Duplicate the image chunk
+        //Duplicate the image struct.
         gettimeofday(&tim, NULL);
         start = tim.tv_sec+(tim.tv_usec/1000000.0);
-        if ( duplicateImageChunk(source, output, chunksize) ) {
+        if ( (output = duplicateImageData(source, partitions, halo)) == NULL) {
             return -1;
         }
-        //DEBUG
-//        for (i=0;i<chunksize;i++)
-//            if (source->R[i]!=output->R[i] || source->G[i]!=output->G[i] || source->B[i]!=output->B[i]) printf("At position i=%d %d!=%d,%d!=%d,%d!=%d\n",i,source->R[i],output->R[i], source->G[i],output->G[i],source->B[i],output->B[i]);
         gettimeofday(&tim, NULL);
         tcopy = tcopy + (tim.tv_sec+(tim.tv_usec/1000000.0) - start);
 
-        //////////////////////////////////////////////////////////////////////////////////////////////////
-        // CHUNK CONVOLUTION
-        //////////////////////////////////////////////////////////////////////////////////////////////////
+        ////////////////////////////////////////
+        //Initialize Image Storing file. Open the file and store the image header.
         gettimeofday(&tim, NULL);
         start = tim.tv_sec+(tim.tv_usec/1000000.0);
-        //#pragma omp sections
-        //{
-         //   #pragma omp section
-            convolve2D(source->R, output->R, source->ancho, (source->altura/partitions)+halosize, kern->vkern, kern->kernelX, kern->kernelY);
-           // #pragma omp section
-            convolve2D(source->G, output->G, source->ancho, (source->altura/partitions)+halosize, kern->vkern, kern->kernelX, kern->kernelY);
-           // #pragma omp section
-            convolve2D(source->B, output->B, source->ancho, (source->altura/partitions)+halosize, kern->vkern, kern->kernelX, kern->kernelY);
-        //}
-
-
-        gettimeofday(&tim, NULL);
-        tconv = tconv + (tim.tv_sec+(tim.tv_usec/1000000.0) - start);
-
-        //////////////////////////////////////////////////////////////////////////////////////////////////
-        // CHUNK SAVING
-        //////////////////////////////////////////////////////////////////////////////////////////////////
-        //Storing resulting image partition.
-        gettimeofday(&tim, NULL);
-        start = tim.tv_sec+(tim.tv_usec/1000000.0);
-        if (savingChunk(output, &fpdst, partsize, offset)) {
+        if (initfilestore(output, &fpdst, argv[3], &position)!=0) {
             perror("Error: ");
             //        free(source);
             //        free(output);
@@ -476,34 +505,153 @@ int main(int argc, char **argv)
         }
         gettimeofday(&tim, NULL);
         tstore = tstore + (tim.tv_sec+(tim.tv_usec/1000000.0) - start);
+    
+        //////////////////////////////////////////////////////////////////////////////////////////////////
+        // CHUNK READING
+        //////////////////////////////////////////////////////////////////////////////////////////////////
+        
+        imagesize = source->altura*source->ancho;
+        partsize  = (source->altura*source->ancho)/partitions;
+    }
+    
+        // broadcast to send ancho and altura
+        int ancho; 
+        int altura;
+        if(rank == 0){
+            ancho = source->ancho;
+            
+        }
+        MPI_Bcast(&ancho, 1, MPI_INT, 0, MPI_COMM_WORLD); 
+       
+    //printf("%s ocupa %dx%d=%d pixels. Partitions=%d, halo=%d, partsize=%d pixels\n", argv[1], source->altura, source->ancho, imagesize, partitions, halo, partsize);
+   
+    int c=0, offset=0;
+     while (c < partitions) {
+        ////////////////////////////////////////////////////////////////////////////////
+        //Reading Next chunk.
+        if(rank == 0){
+            gettimeofday(&tim, NULL);
+            start = tim.tv_sec+(tim.tv_usec/1000000.0);
+            if (c==0) {
+                halosize  = halo/2;
+                chunksize = partsize + (source->ancho*halosize);
+                offset   = 0;
+            }
+            else if(c<partitions-1) {
+                halosize  = halo;
+                chunksize = partsize + (source->ancho*halosize);
+                offset    = (source->ancho*halo/2);
+            }
+            else {
+                halosize  = halo/2;
+                chunksize = partsize + (source->ancho*halosize);
+                offset    = (source->ancho*halo/2);
+            }
+            //DEBUG
+    //        printf("\nRound = %d, position = %ld, partsize= %d, chunksize=%d pixels\n", c, position, partsize, chunksize);
+
+            if (readImage(source, &fpsrc, chunksize, halo/2, &position)) {
+                return -1;
+            }
+            gettimeofday(&tim, NULL);
+            tread = tread + (tim.tv_sec+(tim.tv_usec/1000000.0) - start);
+
+            //Duplicate the image chunk
+            gettimeofday(&tim, NULL);
+            start = tim.tv_sec+(tim.tv_usec/1000000.0);
+            if ( duplicateImageChunk(source, output, chunksize) ) {
+                return -1;
+            }
+            //DEBUG
+    //        for (i=0;i<chunksize;i++)
+    //            if (source->R[i]!=output->R[i] || source->G[i]!=output->G[i] || source->B[i]!=output->B[i]) printf("At position i=%d %d!=%d,%d!=%d,%d!=%d\n",i,source->R[i],output->R[i], source->G[i],output->G[i],source->B[i],output->B[i]);
+            gettimeofday(&tim, NULL);
+            tcopy = tcopy + (tim.tv_sec+(tim.tv_usec/1000000.0) - start);
+            gettimeofday(&tim, NULL);
+            start = tim.tv_sec+(tim.tv_usec/1000000.0);
+        }
+        
+
+        //////////////////////////////////////////////////////////////////////////////////////////////////
+        // CHUNK CONVOLUTION
+        //////////////////////////////////////////////////////////////////////////////////////////////////
+        if(rank == 0){
+            altura = (source->altura/partitions)+halosize;
+        }
+        MPI_Bcast(&altura,1,MPI_INT, 0,MPI_COMM_WORLD);   
+        //printf("soc el proces %i altura %i ancho %i\n", rank,ancho, altura);
+       
+         if(rank == 0){
+            convolve2D(source->R, output->R, ancho, altura, kern->vkern, kern->kernelX, kern->kernelY);
+            convolve2D(source->G, output->G, ancho, altura, kern->vkern, kern->kernelX, kern->kernelY);
+            convolve2D(source->B, output->B, ancho, altura, kern->vkern, kern->kernelX, kern->kernelY);  
+         }else{
+             int source[2];
+            convolve2D(source, source, ancho, altura, kern->vkern, kern->kernelX, kern->kernelY);
+            convolve2D(source, source, ancho, altura, kern->vkern, kern->kernelX, kern->kernelY);
+            convolve2D(source, source, ancho, altura, kern->vkern, kern->kernelX, kern->kernelY);  
+         }
+        
+        
+//        
+
+        
+        
+        
+
+        //////////////////////////////////////////////////////////////////////////////////////////////////
+        // CHUNK SAVING
+        //////////////////////////////////////////////////////////////////////////////////////////////////
+        //Storing resulting image partition.
+        if(rank == 0){
+            gettimeofday(&tim, NULL);
+            tconv = tconv + (tim.tv_sec+(tim.tv_usec/1000000.0) - start);
+            gettimeofday(&tim, NULL);
+            start = tim.tv_sec+(tim.tv_usec/1000000.0);
+
+            if (savingChunk(output, &fpdst, partsize, offset)) {
+                perror("Error: ");
+                //        free(source);
+                //        free(output);
+                return -1;
+            }
+            gettimeofday(&tim, NULL);
+            tstore = tstore + (tim.tv_sec+(tim.tv_usec/1000000.0) - start);
+        }    
         //Next partition
         c++;
     }
+    if(rank ==0){
+        fclose(fpsrc);
+        fclose(fpdst);
 
-    fclose(fpsrc);
-    fclose(fpdst);
+    //    freeImagestructure(&source);
+    //    freeImagestructure(&output);
 
-//    freeImagestructure(&source);
-//    freeImagestructure(&output);
+        gettimeofday(&tim, NULL);
+        tend = tim.tv_sec+(tim.tv_usec/1000000.0);
 
-    gettimeofday(&tim, NULL);
-    tend = tim.tv_sec+(tim.tv_usec/1000000.0);
 
-    printf("Imatge: %s\n", argv[1]);
-    printf("ISizeX : %d\n", source->ancho);
-    printf("ISizeY : %d\n", source->altura);
-    printf("kSizeX : %d\n", kern->kernelX);
-    printf("kSizeY : %d\n", kern->kernelY);
-    printf("%.6lf seconds elapsed for Reading image file.\n", tread);
-    printf("%.6lf seconds elapsed for copying image structure.\n", tcopy);
-    printf("%.6lf seconds elapsed for Reading kernel matrix.\n", treadk);
-    printf("%.6lf seconds elapsed for make the convolution.\n", tconv);
-    printf("%.6lf seconds elapsed for writing the resulting image.\n", tstore);
-    printf("%.6lf seconds elapsed\n", tend-tstart);
-
+        printf("Imatge: %s\n", argv[1]);
+        printf("ISizeX : %d\n", ancho);
+        printf("ISizeY : %d\n", altura);
+        printf("kSizeX : %d\n", kern->kernelX);
+        printf("kSizeY : %d\n", kern->kernelY);
+        int nProcs;
+        MPI_Comm_size(MPI_COMM_WORLD,&nProcs);
+        printf("numThreas : %d\n ",nProcs);
+        printf("%.6lf seconds elapsed for Reading image file.\n", tread);
+        printf("%.6lf seconds elapsed for copying image structure.\n", tcopy);
+        printf("%.6lf seconds elapsed for Reading kernel matrix.\n", treadk);
+        printf("%.6lf seconds elapsed for make the convolution.\n", tconv);
+        printf("%.6lf seconds elapsed for writing the resulting image.\n", tstore);
+        printf("%.6lf seconds elapsed\n", tend-tstart);
+    
     freeImagestructure(&source);
     freeImagestructure(&output);
-
+    }
+    MPI_Finalize();
     return 0;
 }
+
 
